@@ -1,0 +1,10 @@
+# PEACHY ENGINE — dependencies
+# Install with:  pip install -r requirements.txt
+
+# Schwab Trader API wrapper (handles OAuth2 + auto token refresh).
+schwabdev>=2.4.0
+
+# Loads a local .env in development (no-op in production if not present).
+python-dotenv>=1.0.0
+
+# Standard library covers the rest (urllib for Pushover, zoneinfo, etc.).

@@ -1,0 +1,25 @@
+# Schwab OAuth token — NEVER commit this. Refreshes on its own.
+schwab_token.json
+/data/
+
+# Local env
+.env
+.env.local
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+
+# Logs
+log.txt
+*.log

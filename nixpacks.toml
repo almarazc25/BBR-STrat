@@ -1,0 +1,15 @@
+# Nixpacks build config for Railway.
+# Pin Python 3.11 so zoneinfo + schwabdev behave consistently.
+
+[phases.setup]
+nixPkgs = ["python311", "gcc"]
+
+[phases.install]
+cmds = ["python -m venv /opt/venv", "/opt/venv/bin/pip install --upgrade pip", "/opt/venv/bin/pip install -r requirements.txt"]
+
+[start]
+cmd = "/opt/venv/bin/python run.py --serve"
+
+[variables]
+PYTHONUNBUFFERED = "1"
+TZ = "America/New_York"
