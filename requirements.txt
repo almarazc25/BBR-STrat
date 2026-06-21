@@ -1,8 +1,11 @@
 # PEACHY ENGINE — dependencies
 # Install with:  pip install -r requirements.txt
 
-# Schwab Trader API wrapper (handles OAuth2 + auto token refresh).
-schwabdev>=2.4.0
+# Yahoo Finance data (no auth, no tokens).
+yfinance>=0.2.40
+
+# BSM greeks (Yahoo doesn't return greeks — we compute them locally).
+scipy>=1.11.0
 
 # Loads a local .env in development (no-op in production if not present).
 python-dotenv>=1.0.0
