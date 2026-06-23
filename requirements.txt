@@ -1,13 +1,16 @@
 # PEACHY ENGINE — dependencies
 # Install with:  pip install -r requirements.txt
 
-# Yahoo Finance data (no auth, no tokens).
+# --- Schwab data path (default) ---
+# Pinned <3 because schwabdev v3 changed its constructor signature and
+# breaks our client. v2.x is stable.
+schwabdev>=2.4.0,<3.0.0
+
+# --- Yahoo Finance fallback path (no auth, ~15 min delayed) ---
 yfinance>=0.2.40
+scipy>=1.11.0  # for BSM greeks on the Yahoo path
 
-# BSM greeks (Yahoo doesn't return greeks — we compute them locally).
-scipy>=1.11.0
-
-# Loads a local .env in development (no-op in production if not present).
+# --- Local .env loader (no-op if not present) ---
 python-dotenv>=1.0.0
 
 # Standard library covers the rest (urllib for Pushover, zoneinfo, etc.).

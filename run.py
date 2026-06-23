@@ -7,11 +7,15 @@ Three modes:
     python run.py --serve    # long-running daemon, fires at RUN_TIME_ET daily
     python run.py --live     # intraday polling, alerts on exposure shifts
 
-Data layer is Yahoo Finance via yfinance — no auth, no tokens.
+Data source is picked by settings.DATA_SOURCE:
+    "schwab"  -> real-time Schwab API (default)
+    "yahoo"   -> free yfinance fallback (~15 min delayed)
 =============================================================================
 """
 
+import os
 import sys
+import json
 import time
 import argparse
 import traceback
@@ -19,7 +23,6 @@ import datetime as dt
 from zoneinfo import ZoneInfo
 
 from config import settings
-from core.yahoo_client import YahooData
 from core import exposures, levels as levels_mod, environment, briefing
 from output import pushover
 
@@ -27,9 +30,52 @@ ET = ZoneInfo("America/New_York")
 
 
 # --------------------------------------------------------------------------- #
-# Core per-ticker analysis (shared by all three modes)
+# Data source selection
 # --------------------------------------------------------------------------- #
-def analyze_ticker(data: YahooData, ticker: str):
+def make_data_client():
+    """Pick the data backend based on settings.DATA_SOURCE."""
+    src = settings.DATA_SOURCE
+    if src == "yahoo":
+        from core.yahoo_client import YahooData
+        return YahooData()
+    if src == "schwab":
+        bootstrap_token_from_env()
+        from core.schwab_client import SchwabData
+        return SchwabData()
+    raise ValueError(f"Unknown DATA_SOURCE: {src!r} (use 'schwab' or 'yahoo')")
+
+
+def bootstrap_token_from_env():
+    """If SCHWAB_TOKEN_JSON env var is provided and the token file is
+    missing, write it. Lets a headless container start without an
+    interactive OAuth flow — generate the file once locally, then paste
+    its contents into Railway's SCHWAB_TOKEN_JSON variable."""
+    path = settings.SCHWAB_TOKEN_PATH
+    payload = settings.SCHWAB_TOKEN_JSON
+    if not payload:
+        return
+    if os.path.exists(path):
+        return
+    try:
+        parent = os.path.dirname(path)
+        if parent:
+            os.makedirs(parent, exist_ok=True)
+    except Exception:
+        pass
+    try:
+        json.loads(payload)
+    except Exception as e:
+        print(f"[bootstrap] SCHWAB_TOKEN_JSON is not valid JSON: {e}")
+        return
+    with open(path, "w") as f:
+        f.write(payload)
+    print(f"[bootstrap] wrote Schwab token to {path}")
+
+
+# --------------------------------------------------------------------------- #
+# Per-ticker analysis (shared by all three modes)
+# --------------------------------------------------------------------------- #
+def analyze_ticker(data, ticker: str):
     chain = data.get_chain(ticker)
     spot = chain["spot"]
     candles = data.get_price_history(ticker)
@@ -75,15 +121,16 @@ def analyze_ticker(data: YahooData, ticker: str):
 
 
 # --------------------------------------------------------------------------- #
-# Mode 1 — one-shot (the original behavior)
+# Mode 1 — one-shot
 # --------------------------------------------------------------------------- #
 def run_once():
     now = dt.datetime.now(ET).strftime("%Y-%m-%d %H:%M ET")
     header = f"\n########## PEACHY ENGINE — {now} ##########\n"
     if settings.PRINT_TO_TERMINAL:
         print(header)
+        print(f"(data source: {settings.DATA_SOURCE})\n")
 
-    data = YahooData()
+    data = make_data_client()
 
     for ticker in settings.TICKERS:
         try:
@@ -110,7 +157,8 @@ def serve_forever():
     hh, mm = settings.RUN_TIME_ET.split(":")
     target_h, target_m = int(hh), int(mm)
     print(f"[serve] will run weekdays at {target_h:02d}:{target_m:02d} ET "
-          f"(tickers: {', '.join(settings.TICKERS)})")
+          f"(tickers: {', '.join(settings.TICKERS)}, "
+          f"source: {settings.DATA_SOURCE})")
 
     if settings.RUN_ON_START:
         print("[serve] RUN_ON_START is true — running once immediately.")
@@ -149,7 +197,6 @@ def _parse_hhmm(s: str):
 
 
 def _top_wall_strike(gex_levels: list):
-    """Strike of the single largest |GEX| wall, or None."""
     if not gex_levels:
         return None
     biggest = max(gex_levels, key=lambda l: abs(l.get("gex", 0.0)))
@@ -157,25 +204,23 @@ def _top_wall_strike(gex_levels: list):
 
 
 def _detect_shifts(ticker: str, baseline: dict, current: dict) -> list:
-    """Return list of human-readable alert lines describing material changes
-    from the morning baseline. Empty list = nothing worth alerting on."""
+    """Return list of alert lines describing material changes from the
+    morning baseline. Empty list = nothing worth alerting on."""
     alerts = []
 
     base_gex = baseline["gex"]["net_gex"]
     curr_gex = current["gex"]["net_gex"]
 
-    # 1. Gamma regime flip.
     if settings.GEX_FLIP_ALERT:
         base_sign = 1 if base_gex >= 0 else -1
         curr_sign = 1 if curr_gex >= 0 else -1
         if base_sign != curr_sign:
             base_label = "+Gamma" if base_sign > 0 else "-Gamma"
             curr_label = "+Gamma" if curr_sign > 0 else "-Gamma"
-            regime_word = ("trending" if curr_sign < 0 else "mean-reverting")
+            regime_word = "trending" if curr_sign < 0 else "mean-reverting"
             alerts.append(f"GEX FLIPPED: {base_label} -> {curr_label} "
                           f"({regime_word} regime now)")
 
-    # 2. DEX shift beyond threshold.
     base_dex = baseline["net_dex"]
     curr_dex = current["net_dex"]
     denom = max(abs(base_dex), 1.0)
@@ -193,7 +238,6 @@ def _detect_shifts(ticker: str, baseline: dict, current: dict) -> list:
             pct = (curr_dex - base_dex) / denom * 100.0
             alerts.append(f"DEX shifted {pct:+.0f}% vs baseline ({curr_b})")
 
-    # 3. Top GEX wall moved by N or more strikes.
     base_top = _top_wall_strike(baseline["gex_levels"])
     curr_top = _top_wall_strike(current["gex_levels"])
     if base_top is not None and curr_top is not None:
@@ -206,7 +250,7 @@ def _detect_shifts(ticker: str, baseline: dict, current: dict) -> list:
 def _in_market_hours(now: dt.datetime) -> bool:
     open_h, open_m = _parse_hhmm(settings.LIVE_MODE_START)
     close_h, close_m = _parse_hhmm(settings.LIVE_MODE_END)
-    if now.weekday() >= 5:  # weekend
+    if now.weekday() >= 5:
         return False
     o = now.replace(hour=open_h, minute=open_m, second=0, microsecond=0)
     c = now.replace(hour=close_h, minute=close_m, second=0, microsecond=0)
@@ -219,13 +263,13 @@ def run_live_mode():
     print(f"[live] starting intraday polling every "
           f"{settings.POLL_INTERVAL_MINUTES} min "
           f"({settings.LIVE_MODE_START}-{settings.LIVE_MODE_END} ET, "
-          f"tickers: {', '.join(settings.TICKERS)})")
+          f"tickers: {', '.join(settings.TICKERS)}, "
+          f"source: {settings.DATA_SOURCE})")
 
-    data = YahooData()
-    baselines = {}  # ticker -> first analysis result
-    fired_alerts = {t: set() for t in settings.TICKERS}  # dedupe per session
+    data = make_data_client()
+    baselines = {}
+    fired_alerts = {t: set() for t in settings.TICKERS}
 
-    # Initial pass: full analysis + briefing as baseline.
     for ticker in settings.TICKERS:
         try:
             r = analyze_ticker(data, ticker)
@@ -261,7 +305,6 @@ def run_live_mode():
         for ticker in settings.TICKERS:
             base = baselines.get(ticker)
             if base is None:
-                # Baseline failed earlier — try again now.
                 try:
                     base = analyze_ticker(data, ticker)
                     baselines[ticker] = base
@@ -280,15 +323,12 @@ def run_live_mode():
                     print(f"[live] {ts} {ticker}: no material change.")
                 continue
 
-            # Dedupe identical alert sets within the session so a single
-            # persistent regime change doesn't spam every poll.
             key = "|".join(alerts)
             if key in fired_alerts[ticker]:
                 continue
             fired_alerts[ticker].add(key)
 
-            head = (f"SPY EXPOSURE SHIFT" if ticker == "SPY"
-                    else f"{ticker} EXPOSURE SHIFT")
+            head = f"{ticker} EXPOSURE SHIFT"
             body_lines = [f"{head} - {ts}"] + alerts
             body_lines.append("Action: prior setup may be invalid. Reassess.")
             message = "\n".join(body_lines)
@@ -303,9 +343,9 @@ def run_live_mode():
 def main():
     parser = argparse.ArgumentParser(description="Peachy Engine")
     parser.add_argument("--serve", action="store_true",
-                        help="Long-running scheduler mode (fires at RUN_TIME_ET).")
+                        help="Long-running scheduler mode.")
     parser.add_argument("--live", action="store_true",
-                        help="Intraday polling mode (alerts on exposure shifts).")
+                        help="Intraday polling mode.")
     args = parser.parse_args()
 
     if args.serve:
