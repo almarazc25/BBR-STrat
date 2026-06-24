@@ -34,6 +34,36 @@ from output import pushover
 
 ET = ZoneInfo("America/New_York")
 
+# --------------------------------------------------------------------------- #
+# Notification helper — wraps Pushover with the configurable prefix
+# --------------------------------------------------------------------------- #
+def _notify(title: str, message: str):
+    prefix = settings.NOTIFICATION_PREFIX
+    if prefix:
+        title = f"{prefix} {title}"
+    pushover.send(title, message)
+
+
+# --------------------------------------------------------------------------- #
+# Best-of: pick the highest-graded ticker (tiebreak by direction conviction)
+# --------------------------------------------------------------------------- #
+_GRADE_RANK = {"A+": 5, "A": 4, "B": 3, "C": 2, "NO-TRADE": 0}
+
+
+def best_of(results: dict):
+    """results = {ticker: analysis_result}. Returns (best_ticker, others_list)."""
+    def key(item):
+        t, r = item
+        gr = _GRADE_RANK.get(r["grade"]["grade"], 0)
+        conv = r.get("direction", {}).get("conviction", 0.0) or 0.0
+        return (gr, conv)
+    ranked = sorted(results.items(), key=key, reverse=True)
+    if not ranked:
+        return None, []
+    best_t = ranked[0][0]
+    others = [(t, r) for t, r in ranked[1:]]
+    return best_t, others
+
 
 # --------------------------------------------------------------------------- #
 # Data source selection
@@ -133,23 +163,31 @@ def run_once():
         print(f"(data source: {settings.DATA_SOURCE})\n")
 
     data = make_data_client()
+    results = {}
 
     for ticker in settings.TICKERS:
         try:
             r = analyze_ticker(data, ticker)
         except Exception as e:  # noqa: BLE001
-            err = f"{ticker}: ERROR during analysis: {e}"
-            print(err)
+            print(f"{ticker}: ERROR during analysis: {e}")
             traceback.print_exc()
-            pushover.send(f"Peachy {ticker} ERROR", str(e))
             continue
-
+        results[ticker] = r
         if settings.PRINT_TO_TERMINAL:
             print(r["full"])
             print()
 
-        title = f"Peachy {ticker} — {r['grade']['grade']}"
-        pushover.send(title, r["push"])
+    if not results:
+        _notify("DATA ERROR", "Analysis failed for all tickers.")
+        return
+
+    if settings.CONSOLIDATE_TICKERS and len(results) > 1:
+        best_t, others = best_of(results)
+        title, body = _format_consolidated_briefing(best_t, results[best_t], others)
+        _notify(title, body)
+    else:
+        for t, r in results.items():
+            _notify(f"{t} — {r['grade']['grade']}", r["push"])
 
 
 # --------------------------------------------------------------------------- #
@@ -258,23 +296,83 @@ def _next_run_time(now: dt.datetime) -> dt.datetime:
 def send_morning_briefing(data, state):
     print(f"\n########## MORNING BRIEFING — "
           f"{dt.datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')} ##########\n")
+    results = {}
     for ticker in settings.TICKERS:
         try:
             r = analyze_ticker(data, ticker)
         except Exception as e:  # noqa: BLE001
             print(f"[morning] {ticker} ERROR: {e}")
             traceback.print_exc()
-            pushover.send(f"Peachy {ticker} ERROR", str(e))
             continue
         state["baselines"][ticker] = r
+        results[ticker] = r
         if settings.PRINT_TO_TERMINAL:
             print(r["full"])
             print()
-        pushover.send(f"Peachy {ticker} — {r['grade']['grade']}", r["push"])
+
+    if not results:
+        _notify("DATA ERROR", "Morning briefing failed for all tickers.")
+        return
+
+    if settings.CONSOLIDATE_TICKERS and len(results) > 1:
+        best_t, others = best_of(results)
+        title, body = _format_consolidated_briefing(best_t, results[best_t], others)
+        _notify(title, body)
+    else:
+        for t, r in results.items():
+            _notify(f"{t} — {r['grade']['grade']}", r["push"])
+
+
+def _format_consolidated_briefing(best_t: str, best: dict, others: list):
+    """Single-notification briefing. Best pick gets the actionable text;
+    others get a one-line tail."""
+    setup = best["setup"]
+    grade = best["grade"]["grade"]
+    spot  = best["spot"]
+    gamma_word = best["gamma"]["regime"]
+
+    if setup["setup"] == "NONE":
+        title = f"NO TRADE — best {best_t} ({grade})"
+        lines = [
+            f"{best_t}: NO TRADE · {gamma_word} gamma · no clean direction.",
+        ]
+        for t, r in others:
+            lines.append(f"({t}: {r['setup']['setup']} {r['grade']['grade']})"
+                         if r['setup']['setup'] != 'NONE'
+                         else f"({t}: no trade)")
+        return title, "\n".join(lines)
+
+    side = (setup.get("side") or "").upper()
+    action = setup.get("action_level")
+    target = setup.get("target_level")
+    action_s = f"{action['price']:.2f}" if action else "—"
+    target_s = f"{target['price']:.2f}" if target else "—"
+    conf = " [CONF]" if (action and action.get("is_confluent")) else ""
+    manage = "scale out fast" if gamma_word == "positive" else "hold runners"
+
+    title = f"{best_t} {setup['setup']} {side} · {grade}"
+    lines = [
+        f"Spot {spot:.2f} · {gamma_word} gamma",
+        f"Action {action_s}{conf} · Target {target_s}",
+        f"Enter: {setup['trigger']}",
+        f"Manage: stop beyond {action_s}, {manage}.",
+    ]
+    for t, r in others:
+        if r["setup"]["setup"] == "NONE":
+            lines.append(f"({t}: no trade)")
+        else:
+            other_side = (r["setup"].get("side") or "").upper()
+            lines.append(f"({t}: {r['setup']['setup']} {other_side} "
+                         f"{r['grade']['grade']})")
+    return title, "\n".join(lines)
 
 
 def poll_intraday(data, state, now: dt.datetime):
+    """Run one poll across all tickers. Collect all new alerts, send AT MOST
+    ONE consolidated notification per poll cycle."""
     ts = now.strftime("%H:%M ET")
+    poll_alerts = []   # list of (ticker, kind, text)
+
     for ticker in settings.TICKERS:
         base = state["baselines"].get(ticker)
         try:
@@ -287,41 +385,58 @@ def poll_intraday(data, state, now: dt.datetime):
             state["baselines"][ticker] = curr
             base = curr
 
-        # 1) Material exposure shifts
         shifts = _detect_shifts(base, curr)
         for alert in shifts:
             if alert in state["fired_alerts"][ticker]:
                 continue
             state["fired_alerts"][ticker].add(alert)
-            msg = (f"{ticker} EXPOSURE SHIFT - {ts}\n{alert}\n"
-                   f"Action: prior setup may be invalid. Reassess.")
-            print(msg)
-            pushover.send(f"Peachy {ticker} SHIFT", msg)
+            poll_alerts.append((ticker, "SHIFT", alert))
 
-        # 2) Proximity to top walls
         prox = _detect_proximity(curr)
         for key, text in prox:
             if key in state["fired_proximity"][ticker]:
                 continue
             state["fired_proximity"][ticker].add(key)
-            msg = f"{ticker} NEAR LEVEL - {ts}\n{text}"
-            print(msg)
-            pushover.send(f"Peachy {ticker} NEAR", msg)
+            poll_alerts.append((ticker, "NEAR", text))
 
-        if not shifts and not prox and settings.PRINT_TO_TERMINAL:
-            print(f"[poll] {ts} {ticker}: no material change.")
+    if not poll_alerts:
+        if settings.PRINT_TO_TERMINAL:
+            print(f"[poll] {ts}: no material change.")
+        return
+
+    # Single consolidated notification
+    by_ticker = {}
+    for tk, kind, text in poll_alerts:
+        by_ticker.setdefault(tk, []).append(f"{kind}: {text}")
+
+    tickers_involved = list(by_ticker.keys())
+    if len(tickers_involved) == 1:
+        title = f"{tickers_involved[0]} INTRADAY — {ts}"
+    else:
+        title = f"{'+'.join(tickers_involved)} INTRADAY — {ts}"
+
+    lines = []
+    for tk, items in by_ticker.items():
+        for item in items:
+            lines.append(f"{tk}: {item}")
+    lines.append("Reassess: setup, level, R:R.")
+
+    msg = "\n".join(lines)
+    print(f"\n--- INTRADAY ALERT {ts} ---\n{msg}\n")
+    _notify(title, msg)
 
 
 def send_closing_summary(data, state):
-    """Brief end-of-day recap per ticker."""
+    """Single end-of-day recap for all tickers."""
     print(f"\n########## CLOSING SUMMARY — "
           f"{dt.datetime.now(ET).strftime('%Y-%m-%d %H:%M ET')} ##########\n")
+    blocks = []
     for ticker in settings.TICKERS:
         base = state["baselines"].get(ticker)
         try:
             curr = analyze_ticker(data, ticker)
         except Exception as e:  # noqa: BLE001
-            pushover.send(f"Peachy {ticker} CLOSE ERROR", str(e))
+            blocks.append(f"{ticker}: close data ERROR ({e})")
             continue
 
         spot = curr["spot"]
@@ -329,15 +444,12 @@ def send_closing_summary(data, state):
         change = spot - base_spot
         pct = (change / base_spot * 100.0) if base_spot else 0.0
 
-        lines = [
-            f"{ticker} CLOSE {spot:.2f}  ({change:+.2f}, {pct:+.2f}%)",
-            f"Gamma: was {base['gamma']['regime'] if base else '?'} "
-            f"-> now {curr['gamma']['regime']}",
-        ]
+        sub = [f"{ticker} {spot:.2f} ({change:+.2f}, {pct:+.2f}%)"]
         if base:
-            lines.append(
-                f"Morning bias was {base['direction']['direction']} "
-                f"({base['setup']['setup']}, Grade {base['grade']['grade']})"
+            sub.append(
+                f"  gamma {base['gamma']['regime']} -> {curr['gamma']['regime']}; "
+                f"bias was {base['direction']['direction']} "
+                f"({base['setup']['setup']} {base['grade']['grade']})"
             )
             action = base["setup"].get("action_level")
             target = base["setup"].get("target_level")
@@ -345,19 +457,19 @@ def send_closing_summary(data, state):
             if action and side:
                 took = ((side == "long" and spot > action["price"]) or
                         (side == "short" and spot < action["price"]))
-                lines.append(f"Action {action['price']:.2f}: "
-                             f"{'taken' if took else 'NOT taken'}")
-            if target and side:
-                hit = ((side == "long" and spot >= target["price"]) or
-                       (side == "short" and spot <= target["price"]))
-                lines.append(f"Target {target['price']:.2f}: "
-                             f"{'HIT' if hit else 'not reached'}")
+                act_s = f"action {action['price']:.2f} {'taken' if took else 'NOT taken'}"
+                if target and side:
+                    hit = ((side == "long" and spot >= target["price"]) or
+                           (side == "short" and spot <= target["price"]))
+                    act_s += f", target {target['price']:.2f} {'HIT' if hit else 'missed'}"
+                sub.append(f"  {act_s}")
+        blocks.append("\n".join(sub))
 
-        msg = "\n".join(lines)
-        if settings.PRINT_TO_TERMINAL:
-            print(msg)
-            print()
-        pushover.send(f"Peachy {ticker} CLOSE", msg)
+    msg = "\n\n".join(blocks)
+    if settings.PRINT_TO_TERMINAL:
+        print(msg)
+        print()
+    _notify(f"CLOSE — {dt.datetime.now(ET).strftime('%H:%M ET')}", msg)
 
 
 def _reset_state_for_day(state, today):
@@ -481,19 +593,30 @@ def run_live_mode():
     state = {}
     _reset_state_for_day(state, dt.datetime.now(ET).date())
 
-    # Baseline = run analysis once at startup, push as "BASELINE" notification
+    # Baseline = run analysis once at startup, send ONE consolidated notification
+    baseline_results = {}
     for ticker in settings.TICKERS:
         try:
             r = analyze_ticker(data, ticker)
             state["baselines"][ticker] = r
+            baseline_results[ticker] = r
             if settings.PRINT_TO_TERMINAL:
                 print(r["full"])
                 print()
-            pushover.send(f"Peachy {ticker} BASELINE — {r['grade']['grade']}",
-                          r["push"])
         except Exception as e:  # noqa: BLE001
             print(f"[live] baseline {ticker} ERROR: {e}")
             traceback.print_exc()
+
+    if baseline_results:
+        if settings.CONSOLIDATE_TICKERS and len(baseline_results) > 1:
+            best_t, others = best_of(baseline_results)
+            title, body = _format_consolidated_briefing(best_t,
+                                                       baseline_results[best_t],
+                                                       others)
+            _notify(f"BASELINE · {title}", body)
+        else:
+            for t, r in baseline_results.items():
+                _notify(f"{t} BASELINE — {r['grade']['grade']}", r["push"])
 
     poll_s = settings.POLL_INTERVAL_MINUTES * 60
 

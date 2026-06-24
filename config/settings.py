@@ -165,7 +165,21 @@ PRIME_WINDOW_ET = (
 # 10. SCHEDULER (long-running --serve mode)
 # ---------------------------------------------------------------------------
 RUN_TIME_ET = _env("RUN_TIME_ET", "09:00")
-RUN_ON_START = _env_bool("RUN_ON_START", False)
+# Fires a briefing immediately on container start (= every Railway redeploy).
+# Default True so you always get a fresh notification after pushing.
+RUN_ON_START = _env_bool("RUN_ON_START", True)
+
+# Notification prefix for Pushover titles. Default empty — the engine drops
+# the old "Peachy" prefix unless you re-add it via env.
+NOTIFICATION_PREFIX = _env("NOTIFICATION_PREFIX", "")
+
+# Pick the highest-graded ticker and send ONE notification per phase instead
+# of one per ticker. The runner-up is summarized in a single line below.
+CONSOLIDATE_TICKERS = _env_bool("CONSOLIDATE_TICKERS", True)
+
+# Schwab API call retry attempts (covers the 10s read timeouts during
+# pre/post market when Schwab's gateway is slow).
+SCHWAB_RETRY_ATTEMPTS = _env_int("SCHWAB_RETRY_ATTEMPTS", 3)
 
 
 # ---------------------------------------------------------------------------

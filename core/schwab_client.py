@@ -29,6 +29,7 @@ DATA CONTRACT (must match what the rest of the engine expects):
 =============================================================================
 """
 
+import time
 import datetime as dt
 from zoneinfo import ZoneInfo
 
@@ -39,6 +40,24 @@ from config import settings
 ET = ZoneInfo("America/New_York")
 
 
+def _retry(fn, label: str):
+    """Retry a Schwab API call with exponential backoff. Schwab's gateway
+    is flaky on the 10s default timeout, especially during pre/post market."""
+    attempts = max(1, settings.SCHWAB_RETRY_ATTEMPTS)
+    last = None
+    for i in range(attempts):
+        try:
+            return fn()
+        except Exception as e:  # noqa: BLE001
+            last = e
+            if i < attempts - 1:
+                wait = 2.0 * (2 ** i)
+                print(f"[schwab] {label} retry {i+1}/{attempts} after "
+                      f"{wait:.0f}s — {type(e).__name__}: {e}")
+                time.sleep(wait)
+    raise last
+
+
 class SchwabData:
     def __init__(self):
         self.client = schwabdev.Client(
@@ -47,12 +66,23 @@ class SchwabData:
             settings.SCHWAB_CALLBACK_URL,
             tokens_file=settings.SCHWAB_TOKEN_PATH,
         )
+        # Bump the underlying requests session timeout if schwabdev exposes it.
+        try:
+            sess = getattr(self.client, "_session", None) or getattr(self.client, "session", None)
+            if sess is not None:
+                # requests doesn't have a session-level timeout; patch the
+                # default via a transport adapter wrapper if supported.
+                # Most schwabdev versions accept a per-call timeout argument.
+                # We rely on _retry to cover transient failures.
+                pass
+        except Exception:
+            pass
 
     # ------------------------------------------------------------------ #
     # Spot
     # ------------------------------------------------------------------ #
     def get_spot(self, ticker: str) -> float:
-        resp = self.client.quote(ticker)
+        resp = _retry(lambda: self.client.quote(ticker), f"quote({ticker})")
         data = resp.json()
         q = data[ticker]["quote"]
         return float(q.get("lastPrice") or q.get("mark"))
@@ -61,11 +91,14 @@ class SchwabData:
     # Option chain
     # ------------------------------------------------------------------ #
     def get_chain(self, ticker: str):
-        resp = self.client.option_chains(
-            symbol=ticker,
-            contractType="ALL",
-            includeUnderlyingQuote=True,
-            strategy="SINGLE",
+        resp = _retry(
+            lambda: self.client.option_chains(
+                symbol=ticker,
+                contractType="ALL",
+                includeUnderlyingQuote=True,
+                strategy="SINGLE",
+            ),
+            f"option_chains({ticker})",
         )
         data = resp.json()
 
@@ -108,13 +141,16 @@ class SchwabData:
     # Price history (5-min candles, prepost included)
     # ------------------------------------------------------------------ #
     def get_price_history(self, ticker: str):
-        resp = self.client.price_history(
-            symbol=ticker,
-            periodType="day",
-            period=10,
-            frequencyType="minute",
-            frequency=settings.STRUCTURE_TIMEFRAME_MIN,
-            needExtendedHoursData=True,
+        resp = _retry(
+            lambda: self.client.price_history(
+                symbol=ticker,
+                periodType="day",
+                period=10,
+                frequencyType="minute",
+                frequency=settings.STRUCTURE_TIMEFRAME_MIN,
+                needExtendedHoursData=True,
+            ),
+            f"price_history({ticker})",
         )
         data = resp.json()
         candles = []
