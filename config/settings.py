@@ -177,3 +177,7 @@ LIVE_MODE_END = _env("LIVE_MODE_END", "16:00")
 GEX_FLIP_ALERT = _env_bool("GEX_FLIP_ALERT", True)
 DEX_SHIFT_PCT = _env_float("DEX_SHIFT_PCT", 0.25)
 LEVEL_SHIFT_STRIKES = _env_int("LEVEL_SHIFT_STRIKES", 3)
+
+# Proximity alert: fire when spot enters this % band of a top GEX wall.
+# 0.0025 = 0.25% (about 1.50 from a 600-level wall on SPY).
+PROXIMITY_PCT = _env_float("PROXIMITY_PCT", 0.0025)
