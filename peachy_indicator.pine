@@ -1,0 +1,337 @@
+//@version=6
+// =============================================================================
+// PEACHY BBR v2  —  Pine Script v6
+// =============================================================================
+// Companion to the Peachy Engine pre-market briefing.
+//
+// The ENGINE tells you WHERE + WHAT KIND OF DAY. This INDICATOR is the WHEN.
+// Type in the levels from the briefing — up to 6 — and the indicator scans
+// live for Wall St Sophia's BBR confirmations (Bounce, Break, Reject) at any
+// of them, in either direction. It only fires on a CONFIRMED 5-min close
+// with a real displacement body and a valid tap/retest. No close = no signal.
+//
+// >>> RUN THIS ON THE 5-MIN CHART. <<<
+//
+// WHAT CHANGED FROM v1
+//   - Multi-level: up to 6 levels, each tagged Support / Resistance / Wall.
+//     Engine briefing usually gives 4; extras are for PDH/PDL or your own marks.
+//   - Zone-based: each level is a ZONE (price ± width%), not a single price.
+//     Big GEX walls react across a small range — this matches reality.
+//   - Auto-scan: no need to lock to one setup. Indicator watches every level
+//     for the setup that fits its tag (Support -> bounce, Resistance -> reject,
+//     Wall -> both; any level -> break if price closes through it).
+//   - Direction filter is optional. Default "Both" lets it call either side.
+//     Lock to Long / Short only if the engine gave a clean directional bias.
+//   - Cleaner visuals: zone boxes + clean labels instead of triangles.
+//   - Built-in 200 EMA + trend coloring (engine uses this — nice to see live).
+//   - Grade per signal: confluence + volume + prime window + trend agreement.
+// =============================================================================
+
+indicator("Peachy BBR v2", shorttitle="PEACHY v2",
+          overlay=true, max_lines_count=50, max_labels_count=200,
+          max_boxes_count=50)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// TYPE
+// ─────────────────────────────────────────────────────────────────────────────
+type Level
+    float  price
+    string kind       // "Support" | "Resistance" | "Wall"
+    bool   confluent
+    string lbl
+    bool   brokenUp
+    bool   brokenDown
+    int    barsSinceBreak
+
+// ─────────────────────────────────────────────────────────────────────────────
+// INPUTS
+// ─────────────────────────────────────────────────────────────────────────────
+grpFilter = "▶ Filters"
+i_dirFilter   = input.string("Both", "Direction filter",
+    options=["Long only", "Short only", "Both"], group=grpFilter,
+    tooltip="Lock signals to one side if the briefing gave a clean directional bias.")
+i_setupFilter = input.string("All", "Setup filter",
+    options=["All", "Break only", "Bounce only", "Reject only"], group=grpFilter,
+    tooltip="Default 'All' scans for any BBR setup at any level.")
+
+grpLvl = "▶ Levels (paste from the briefing)"
+i_zoneWidth = input.float(0.10, "Zone half-width (% of price)",
+    minval=0.0, maxval=0.5, step=0.01, group=grpLvl,
+    tooltip="Each level becomes a zone of price ± this %. 0.10 = ±0.10%. Big walls react over a small range, not at a single tick.")
+
+// 6 manual slots. Engine usually gives ~4 in the briefing.
+i_p1 = input.price(0.0,  "L1 price",     group=grpLvl)
+i_k1 = input.string("Wall", "L1 kind",   options=["Support","Resistance","Wall"], group=grpLvl)
+i_c1 = input.bool(false, "L1 confluent", group=grpLvl)
+i_l1 = input.string("L1", "L1 label",    group=grpLvl)
+
+i_p2 = input.price(0.0,  "L2 price",     group=grpLvl)
+i_k2 = input.string("Wall", "L2 kind",   options=["Support","Resistance","Wall"], group=grpLvl)
+i_c2 = input.bool(false, "L2 confluent", group=grpLvl)
+i_l2 = input.string("L2", "L2 label",    group=grpLvl)
+
+i_p3 = input.price(0.0,  "L3 price",     group=grpLvl)
+i_k3 = input.string("Wall", "L3 kind",   options=["Support","Resistance","Wall"], group=grpLvl)
+i_c3 = input.bool(false, "L3 confluent", group=grpLvl)
+i_l3 = input.string("L3", "L3 label",    group=grpLvl)
+
+i_p4 = input.price(0.0,  "L4 price",     group=grpLvl)
+i_k4 = input.string("Wall", "L4 kind",   options=["Support","Resistance","Wall"], group=grpLvl)
+i_c4 = input.bool(false, "L4 confluent", group=grpLvl)
+i_l4 = input.string("L4", "L4 label",    group=grpLvl)
+
+i_p5 = input.price(0.0,  "L5 price",     group=grpLvl)
+i_k5 = input.string("Wall", "L5 kind",   options=["Support","Resistance","Wall"], group=grpLvl)
+i_c5 = input.bool(false, "L5 confluent", group=grpLvl)
+i_l5 = input.string("L5", "L5 label",    group=grpLvl)
+
+i_p6 = input.price(0.0,  "L6 price",     group=grpLvl)
+i_k6 = input.string("Wall", "L6 kind",   options=["Support","Resistance","Wall"], group=grpLvl)
+i_c6 = input.bool(false, "L6 confluent", group=grpLvl)
+i_l6 = input.string("L6", "L6 label",    group=grpLvl)
+
+grpConfirm = "▶ Confirmation rules"
+i_bodyMin    = input.float(0.50, "Displacement body % of range",
+    minval=0.10, maxval=0.95, step=0.05, group=grpConfirm,
+    tooltip="Candle body must be at least this fraction of the full range. 0.50 = strong body, not a doji.")
+i_thirdLoc   = input.float(0.3333, "Close-location third",
+    minval=0.10, maxval=0.50, step=0.0333, group=grpConfirm,
+    tooltip="Bullish close in top this-fraction of range; bearish in bottom. 0.333 = top/bottom third.")
+i_retestBars = input.int(12, "Break: max bars to wait for retest",
+    minval=1, maxval=60, group=grpConfirm,
+    tooltip="After price closes through a level, this many 5-min bars before the retest setup goes stale.")
+i_useStrength= input.bool(true, "Bounce/Reject: require close past prior bar's open", group=grpConfirm,
+    tooltip="Sophia's 'strong rejection' rule. Turn off if too strict.")
+
+grpGates = "▶ Optional gates"
+i_useVol   = input.bool(true,  "Require volume WITH the move", group=grpGates)
+i_volLen   = input.int(20,     "Volume average length", minval=5, maxval=100, group=grpGates)
+i_volMult  = input.float(1.2,  "Volume must be >= avg ×", minval=0.5, maxval=5.0, step=0.1, group=grpGates)
+i_usePrime = input.bool(false, "Prime window only", group=grpGates)
+i_primeSess= input.session("0930-1200", "Prime window (ET)", group=grpGates)
+
+grpTrend = "▶ Trend context"
+i_emaLen   = input.int(200, "EMA length (trend filter)", minval=20, maxval=400, group=grpTrend)
+i_emaGrade = input.bool(true, "Bump grade when EMA trend agrees", group=grpTrend)
+i_showEma  = input.bool(true, "Show EMA on chart", group=grpTrend)
+
+grpViz = "▶ Display"
+i_showZones = input.bool(true, "Draw level zones", group=grpViz)
+i_showLabel = input.bool(true, "Label signals with grade", group=grpViz)
+i_bgTint    = input.bool(true, "Tint background on signal bar", group=grpViz)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// BUILD LEVEL ARRAY (once on first bar from the user's inputs)
+// ─────────────────────────────────────────────────────────────────────────────
+var array<Level> levels = array.new<Level>()
+
+if barstate.isfirst
+    array.clear(levels)
+    if i_p1 > 0.0
+        array.push(levels, Level.new(i_p1, i_k1, i_c1, i_l1, false, false, 0))
+    if i_p2 > 0.0
+        array.push(levels, Level.new(i_p2, i_k2, i_c2, i_l2, false, false, 0))
+    if i_p3 > 0.0
+        array.push(levels, Level.new(i_p3, i_k3, i_c3, i_l3, false, false, 0))
+    if i_p4 > 0.0
+        array.push(levels, Level.new(i_p4, i_k4, i_c4, i_l4, false, false, 0))
+    if i_p5 > 0.0
+        array.push(levels, Level.new(i_p5, i_k5, i_c5, i_l5, false, false, 0))
+    if i_p6 > 0.0
+        array.push(levels, Level.new(i_p6, i_k6, i_c6, i_l6, false, false, 0))
+
+nLevels = array.size(levels)
+
+// ─────────────────────────────────────────────────────────────────────────────
+// CANDLE ANATOMY (run native on 5-min, only act on CONFIRMED bars)
+// ─────────────────────────────────────────────────────────────────────────────
+confirmed = barstate.isconfirmed
+rng       = math.max(high - low, syminfo.mintick)
+body      = math.abs(close - open)
+bodyPct   = body / rng
+isBull    = close > open
+isBear    = close < open
+closeLoc  = (close - low) / rng
+closeTop  = closeLoc >= (1.0 - i_thirdLoc)
+closeBot  = closeLoc <= i_thirdLoc
+bullDisp  = isBull and bodyPct >= i_bodyMin and closeTop
+bearDisp  = isBear and bodyPct >= i_bodyMin and closeBot
+strongBull = bullDisp and close > open[1]
+strongBear = bearDisp and close < open[1]
+
+volAvg = ta.sma(volume, i_volLen)
+volOK  = not i_useVol or (not na(volAvg) and volume >= volAvg * i_volMult)
+
+inSession = not na(time(timeframe.period, i_primeSess, "America/New_York"))
+inPrime   = not i_usePrime or inSession
+
+ema = ta.ema(close, i_emaLen)
+trendBull = close > ema
+trendBear = close < ema
+
+allowLong   = (i_dirFilter == "Long only")  or (i_dirFilter == "Both")
+allowShort  = (i_dirFilter == "Short only") or (i_dirFilter == "Both")
+allowBreak  = (i_setupFilter == "All") or (i_setupFilter == "Break only")
+allowBounce = (i_setupFilter == "All") or (i_setupFilter == "Bounce only")
+allowReject = (i_setupFilter == "All") or (i_setupFilter == "Reject only")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SCAN EACH LEVEL
+// ─────────────────────────────────────────────────────────────────────────────
+longFire   = false
+shortFire  = false
+fireLabel  = ""
+fireConfl  = false
+
+if confirmed and nLevels > 0
+    for i = 0 to nLevels - 1
+        lvl = array.get(levels, i)
+        tol = lvl.price * (i_zoneWidth / 100.0)
+        inZone = (low <= lvl.price + tol) and (high >= lvl.price - tol)
+
+        // age any pending break, expire when stale
+        if lvl.brokenUp or lvl.brokenDown
+            lvl.barsSinceBreak += 1
+        if lvl.barsSinceBreak > i_retestBars
+            lvl.brokenUp := false
+            lvl.brokenDown := false
+
+        freshBreak = false
+
+        // ── BREAK setup: works against any level kind ──
+        if allowBreak
+            if allowLong and not lvl.brokenUp and close > lvl.price + tol and bullDisp
+                lvl.brokenUp := true
+                lvl.barsSinceBreak := 0
+                freshBreak := true
+            if allowShort and not lvl.brokenDown and close < lvl.price - tol and bearDisp
+                lvl.brokenDown := true
+                lvl.barsSinceBreak := 0
+                freshBreak := true
+            // retest confirmation — only on a later bar than the break itself
+            if not freshBreak
+                if lvl.brokenUp and allowLong and inZone and bullDisp and close > lvl.price and volOK and inPrime
+                    longFire := true
+                    fireLabel := "BREAK " + lvl.lbl
+                    fireConfl := lvl.confluent
+                    lvl.brokenUp := false
+                if lvl.brokenDown and allowShort and inZone and bearDisp and close < lvl.price and volOK and inPrime
+                    shortFire := true
+                    fireLabel := "BREAK " + lvl.lbl
+                    fireConfl := lvl.confluent
+                    lvl.brokenDown := false
+
+        // ── BOUNCE setup: at Support or Wall, long-side only ──
+        if allowBounce and allowLong and (lvl.kind == "Support" or lvl.kind == "Wall")
+            cand = i_useStrength ? strongBull : bullDisp
+            if inZone and cand and close > lvl.price and volOK and inPrime
+                longFire := true
+                fireLabel := "BOUNCE " + lvl.lbl
+                fireConfl := lvl.confluent
+
+        // ── REJECT setup: at Resistance or Wall, short-side only ──
+        if allowReject and allowShort and (lvl.kind == "Resistance" or lvl.kind == "Wall")
+            cand = i_useStrength ? strongBear : bearDisp
+            if inZone and cand and close < lvl.price and volOK and inPrime
+                shortFire := true
+                fireLabel := "REJECT " + lvl.lbl
+                fireConfl := lvl.confluent
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GRADE
+// ─────────────────────────────────────────────────────────────────────────────
+gradeOf(bool isLong, bool wasConfl) =>
+    int s = 0
+    if wasConfl
+        s += 1
+    if i_useVol and volOK
+        s += 1
+    if i_usePrime and inPrime
+        s += 1
+    if i_emaGrade
+        if isLong and trendBull
+            s += 1
+        if not isLong and trendBear
+            s += 1
+    s >= 3 ? "A+" : s == 2 ? "A" : s == 1 ? "B" : "C"
+
+// ─────────────────────────────────────────────────────────────────────────────
+// VISUALS
+// ─────────────────────────────────────────────────────────────────────────────
+plot(i_showEma ? ema : na, "EMA",
+     color=trendBull ? color.new(color.green, 60) : color.new(color.red, 60),
+     linewidth=1)
+
+// Draw / redraw zone boxes on the last bar
+var array<box>   zones    = array.new<box>()
+var array<label> zoneTags = array.new<label>()
+
+if barstate.islast and i_showZones
+    for j = 0 to array.size(zones) - 1
+        box.delete(array.get(zones, j))
+    for j = 0 to array.size(zoneTags) - 1
+        label.delete(array.get(zoneTags, j))
+    array.clear(zones)
+    array.clear(zoneTags)
+
+    if nLevels > 0
+        for i = 0 to nLevels - 1
+            lvl  = array.get(levels, i)
+            tol  = lvl.price * (i_zoneWidth / 100.0)
+            fill = lvl.kind == "Support"    ? color.new(color.green, 85)
+                 : lvl.kind == "Resistance" ? color.new(color.red,   85)
+                 :                            color.new(color.orange,85)
+            edge = lvl.kind == "Support"    ? color.new(color.green, 50)
+                 : lvl.kind == "Resistance" ? color.new(color.red,   50)
+                 :                            color.new(color.orange,50)
+            bx = box.new(bar_index - 100, lvl.price + tol,
+                         bar_index + 30,  lvl.price - tol,
+                         border_color=edge, bgcolor=fill,
+                         extend=extend.right)
+            array.push(zones, bx)
+            tagText = lvl.lbl + " " + str.tostring(lvl.price, format.mintick) + (lvl.confluent ? " [CONF]" : "")
+            lb = label.new(bar_index + 30, lvl.price, tagText,
+                           textcolor=edge, color=color.new(color.black, 100),
+                           style=label.style_label_left, size=size.small)
+            array.push(zoneTags, lb)
+
+// Signal labels
+if i_showLabel and longFire
+    g = gradeOf(true, fireConfl)
+    label.new(bar_index, low,
+              "LONG • " + fireLabel + " • " + g,
+              yloc=yloc.belowbar, style=label.style_label_up,
+              color=color.new(color.green, 0), textcolor=color.white,
+              size=size.normal)
+if i_showLabel and shortFire
+    g = gradeOf(false, fireConfl)
+    label.new(bar_index, high,
+              "SHORT • " + fireLabel + " • " + g,
+              yloc=yloc.abovebar, style=label.style_label_down,
+              color=color.new(color.red, 0), textcolor=color.white,
+              size=size.normal)
+
+// Background tint on the signal bar — high transparency, easy on the eyes
+bgcolor(i_bgTint and longFire  ? color.new(color.green, 88) : na, title="LONG bg")
+bgcolor(i_bgTint and shortFire ? color.new(color.red,   88) : na, title="SHORT bg")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// ALERTS
+// ─────────────────────────────────────────────────────────────────────────────
+alertcondition(longFire,  title="Peachy LONG",
+    message="PEACHY LONG confirmed on {{ticker}} at {{close}} — see chart for setup + level.")
+alertcondition(shortFire, title="Peachy SHORT",
+    message="PEACHY SHORT confirmed on {{ticker}} at {{close}} — see chart for setup + level.")
+
+// ─────────────────────────────────────────────────────────────────────────────
+// READOUT (top-right)
+// ─────────────────────────────────────────────────────────────────────────────
+var table tbl = table.new(position.top_right, 1, 3, border_width=1)
+if barstate.islast
+    trendStr = trendBull ? "EMA bull" : "EMA bear"
+    table.cell(tbl, 0, 0, "Peachy v2",
+               text_color=color.white, bgcolor=color.new(color.blue, 25), text_size=size.small)
+    table.cell(tbl, 0, 1, "Levels " + str.tostring(nLevels) + " • " + trendStr,
+               text_color=color.white, bgcolor=color.new(color.gray, 40), text_size=size.small)
+    table.cell(tbl, 0, 2, i_dirFilter + " / " + i_setupFilter,
+               text_color=color.white, bgcolor=color.new(color.gray, 40), text_size=size.small)
