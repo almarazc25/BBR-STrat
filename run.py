@@ -245,12 +245,28 @@ def _detect_shifts(baseline: dict, current: dict) -> list:
         if abs(curr_top - base_top) >= settings.LEVEL_SHIFT_STRIKES:
             alerts.append(f"Top wall: {base_top:.0f} -> {curr_top:.0f}")
 
+    # NEW: bias flip — the most important midday signal. If direction read
+    # changed from long to short (or vice versa), that's a different trade,
+    # and you need to know now.
+    base_dir = (baseline.get("direction") or {}).get("direction", "neutral")
+    curr_dir = (current.get("direction")  or {}).get("direction", "neutral")
+    if base_dir != curr_dir:
+        if base_dir != "neutral" and curr_dir != "neutral":
+            alerts.append(f"BIAS FLIPPED: was {base_dir.upper()} -> "
+                          f"now {curr_dir.upper()}")
+        elif curr_dir != "neutral":
+            alerts.append(f"BIAS CLARIFIED: was neutral -> now {curr_dir.upper()}")
+        elif base_dir != "neutral":
+            alerts.append(f"BIAS LOST: was {base_dir.upper()} -> now neutral")
+
     return alerts
 
 
 def _detect_proximity(current: dict):
-    """Alert when spot enters the proximity band of a top GEX wall.
-    Returns list of (key, text) tuples."""
+    """Returns list of (key, text, in_zone) tuples for each top wall.
+    in_zone=True means spot is currently inside the proximity band (alert).
+    in_zone=False means spot has left the band (caller should re-arm dedupe
+    so the NEXT entry can alert again later in the day)."""
     spot = current["spot"]
     walls = current.get("gex_levels", [])[:3]   # top 3 most important
     band = spot * settings.PROXIMITY_PCT
@@ -259,13 +275,15 @@ def _detect_proximity(current: dict):
         strike = w.get("strike")
         if strike is None:
             continue
+        key = f"prox:{strike:.0f}"
         if abs(spot - strike) <= band:
             polarity = w.get("polarity", "wall")
             side_word = "below" if spot < strike else "above"
             txt = (f"Near {polarity} wall {strike:.0f} — spot {spot:.2f} "
                    f"({side_word}, {abs(spot - strike):.2f} away)")
-            key = f"prox:{strike:.0f}"
-            out.append((key, txt))
+            out.append((key, txt, True))
+        else:
+            out.append((key, "", False))
     return out
 
 
@@ -393,11 +411,16 @@ def poll_intraday(data, state, now: dt.datetime):
             poll_alerts.append((ticker, "SHIFT", alert))
 
         prox = _detect_proximity(curr)
-        for key, text in prox:
-            if key in state["fired_proximity"][ticker]:
-                continue
-            state["fired_proximity"][ticker].add(key)
-            poll_alerts.append((ticker, "NEAR", text))
+        for key, text, in_zone in prox:
+            if in_zone:
+                # Fire once per entry into the zone (dedupe).
+                if key in state["fired_proximity"][ticker]:
+                    continue
+                state["fired_proximity"][ticker].add(key)
+                poll_alerts.append((ticker, "NEAR", text))
+            else:
+                # Spot left this zone — re-arm dedupe so the NEXT entry alerts.
+                state["fired_proximity"][ticker].discard(key)
 
     if not poll_alerts:
         if settings.PRINT_TO_TERMINAL:
