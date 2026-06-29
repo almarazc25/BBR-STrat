@@ -93,8 +93,16 @@ def build_full(ticker, spot, gamma, direction, setup, grade, levels,
     else:
         L.append("  Negative gamma -> let runners work, larger targets, "
                  "don't take profits too early.")
-    L.append(f"  Contract: ATM or 1 strike OTM, {('0-2' )}DTE, "
-             f"liquid + tight spread.")
+    # Contract recommendation — DTE picked from setup/regime/grade.
+    from core.environment import recommend_contract
+    contract = recommend_contract(setup, gamma, grade)
+    if contract:
+        L.append(f"  Contract: {contract['strike']}")
+        L.append(f"  DTE: {contract['dte_preferred']}  "
+                 f"(range {contract['dte_range']})")
+        L.append(f"  Why this DTE: {contract['rationale']}")
+    else:
+        L.append("  Contract: ATM or 1 strike OTM, 1-3 DTE, liquid + tight spread.")
     L.append("")
 
     # Grade reasons
@@ -132,11 +140,17 @@ def build_push(ticker, spot, gamma, direction, setup, grade):
     manage = ("scale out fast" if gamma["regime"] == "positive"
               else "hold runners")
 
+    from core.environment import recommend_contract
+    contract = recommend_contract(setup, gamma, grade)
+    contract_line = (f"Use {contract['dte_preferred']} · {contract['strike']}"
+                     if contract else
+                     "ATM or 1 strike OTM, 1-3 DTE")
     lines = [
         f"{ticker} — {setup['setup']} {side} (Grade {grade['grade']})",
         f"Spot {spot:.2f} | {gamma['regime']} gamma",
         f"Action: {al_s}{conf}  Target: {tl_s}",
         f"Enter: {setup['trigger']}",
         f"Manage: stop beyond {al_s}, {manage}.",
+        contract_line,
     ]
     return "\n".join(lines)

@@ -295,6 +295,66 @@ def grade_setup(gamma: dict, direction: dict, vanna_proxy: float,
     return {"grade": grade, "score": score, "reasons": reasons}
 
 
+def recommend_contract(setup: dict, gamma: dict, grade: dict) -> dict:
+    """Pick a DTE range + strike preference based on setup, gamma regime,
+    and grade.
+
+    The single most common loss pattern in this strategy is being on 0-1
+    DTE during a BREAK setup — the move needs time to play out (initial
+    break, retracement, retest, hold, push) and theta eats you alive
+    during the retest wait. The fix is to give BREAKs more time.
+
+    BOUNCE / REJECT are mean-reversion plays — moves happen fast, theta
+    matters less, so 0-2 DTE is fine and lets you keep more leverage.
+
+    Grade tiers within each setup family:
+        A+   → can be aggressive on DTE (move is most likely to work)
+        A    → standard DTE range
+        B    → conservative DTE (give yourself room to be wrong on timing)
+    """
+    if setup.get("setup") == "NONE":
+        return None
+
+    setup_type = setup["setup"]
+    grade_letter = grade.get("grade", "B")
+
+    if setup_type == "BREAK":
+        if grade_letter == "A+":
+            dte_range, dte_pref = "1-3 DTE", "2 DTE"
+        elif grade_letter == "A":
+            dte_range, dte_pref = "2-4 DTE", "2-3 DTE"
+        else:
+            dte_range, dte_pref = "3-5 DTE", "3-4 DTE"
+        rationale = ("Breaks need TIME. Theta on 0-1 DTE eats you during "
+                     "the retest wait — you stop out before the move plays.")
+    elif setup_type in ("BOUNCE", "REJECT"):
+        if grade_letter == "A+":
+            dte_range, dte_pref = "0-2 DTE", "0-1 DTE"
+        elif grade_letter == "A":
+            dte_range, dte_pref = "1-3 DTE", "1-2 DTE"
+        else:
+            dte_range, dte_pref = "2-4 DTE", "2-3 DTE"
+        rationale = ("Reversion plays move fast. 0-2 DTE captures the snap "
+                     "without paying for time you don't need.")
+    else:
+        return None
+
+    # Strike selection — Sophia's standard. OTM gives more leverage on
+    # BREAKs (where price is expected to keep running). ATM is safer on
+    # BOUNCE/REJECT where the move can be smaller.
+    if setup_type == "BREAK":
+        strike_pref = "ATM or 1 strike OTM (OTM for more leverage on runners)"
+    else:
+        strike_pref = "ATM (cleaner delta on a smaller move)"
+
+    return {
+        "dte_range": dte_range,
+        "dte_preferred": dte_pref,
+        "strike": strike_pref,
+        "rationale": rationale,
+    }
+
+
 def _p(level):
     if not level:
         return "—"

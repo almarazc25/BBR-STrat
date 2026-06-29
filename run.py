@@ -369,11 +369,18 @@ def _format_consolidated_briefing(best_t: str, best: dict, others: list):
     manage = "scale out fast" if gamma_word == "positive" else "hold runners"
 
     title = f"{best_t} {setup['setup']} {side} · {grade}"
+    # DTE recommendation — keeps you off 0DTE on breaks etc.
+    from core.environment import recommend_contract
+    contract = recommend_contract(setup, best["gamma"], best["grade"])
+    contract_line = (f"Use {contract['dte_preferred']} · {contract['strike']}"
+                     if contract else
+                     "ATM or 1 strike OTM, 1-3 DTE")
     lines = [
         f"Spot {spot:.2f} · {gamma_word} gamma",
         f"Action {action_s}{conf} · Target {target_s}",
         f"Enter: {setup['trigger']}",
         f"Manage: stop beyond {action_s}, {manage}.",
+        contract_line,
     ]
     for t, r in others:
         if r["setup"]["setup"] == "NONE":
