@@ -96,6 +96,22 @@ PUSHOVER_APP_TOKEN = _env("PUSHOVER_APP_TOKEN", "PUT_YOUR_PUSHOVER_APP_TOKEN_HER
 SEND_PUSHOVER = _env_bool("SEND_PUSHOVER", True)
 PRINT_TO_TERMINAL = _env_bool("PRINT_TO_TERMINAL", True)
 
+# Pushover hardening knobs (added to address intermittent iOS decryption
+# errors and silent transient failures):
+#
+# PUSHOVER_DEVICE — when set, messages target ONLY that device on your
+#   Pushover account. Bypasses any stale device with weird settings.
+#   Find your device name at pushover.net -> Your Devices.
+PUSHOVER_DEVICE = _env("PUSHOVER_DEVICE", "")
+#
+# PUSHOVER_RETRY_ATTEMPTS — how many times to retry on transient errors
+#   (network blips, 5xx responses). 1.5s -> 3s -> 6s backoff.
+PUSHOVER_RETRY_ATTEMPTS = _env_int("PUSHOVER_RETRY_ATTEMPTS", 3)
+#
+# PUSHOVER_SAFE_ASCII — debug aid: strip non-ASCII (★, —, etc.) before send.
+#   Leave false unless chasing a Unicode-related bug.
+PUSHOVER_SAFE_ASCII = _env_bool("PUSHOVER_SAFE_ASCII", False)
+
 
 # ---------------------------------------------------------------------------
 # 4. WHAT TO ANALYZE
